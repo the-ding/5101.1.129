@@ -1,0 +1,1530 @@
+#include <hidef.h>      /* common defines and macros */
+#include "sys.h"
+#include "xgate.h"
+#include "db.h"
+#include "ptl.h"
+#include "drv_sci.h"
+#include "drv_can.h"
+#include "db_para_cfg.h"
+#include "db_para_struct.h"
+
+/****************注意********************/
+/*                                      */
+/*    xgate中不要定义const类型变量      */
+/*                                      */
+/****************************************/
+
+#pragma DATA_SEG SHARED_DATA
+
+extern UINT32   LECU_SnList[];        /*系统当前所有采集板SN列表*/
+extern UINT8    LECU_IdList[];
+extern UINT8    LECU_SnNum;           /*系统当前采集板连接个数*/
+extern UINT8    LECU_Work;            /*工作阶段：(1)第一次请求SN列表，(2)第二次请求SN列表，(0)正常工作*/
+extern UINT8    LECU_IdCur;           /*当前轮询采集板*/
+extern BOOL     BCU_Update;           /*正在通过CAN0口升级采集板程序*/
+extern BOOL     BCU_Transport;        /*主控在CAN0<->CAN4之间透明转发*/
+
+/*pc通讯缓冲 */
+extern DBDevPara        TempDevPara;
+extern UINT8            TempDevGot;
+
+/*串口发送缓冲区 */
+extern UINT8            txBuf[BUFSZ];
+extern volatile UINT16  txRptr;
+extern volatile UINT16  txWptr;
+extern volatile BOOL    txBusy;
+/*串口发送缓冲区 */
+
+
+
+#ifdef PTL_QDWX
+extern UINT32 lecutick[DEV_MAX];
+#endif
+
+#pragma DATA_SEG DEFAULT
+
+
+static  UINT8    QDWX_IdCur = 1;
+static  UINT8    Moddle_Dev = 0;
+
+static  UINT8    Prot_Timer = 0;                //电池保护实时计算单体最大定时器的扩展字节
+static  UINT16   sum_ota = 0;
+
+
+/*****************************************************************************/
+/* 获取CAN扩展帧ID                                                           */
+/*****************************************************************************/
+static UINT32 getEid (Byte *idr)
+{
+    UINT32 i=0;
+
+    i = idr[0];           // CAN.RXIDR0;
+    i <<= 3;
+    i |= idr[1] >> 5;     // CAN.RXIDR1
+    i <<= 3;
+    i |= idr[1] & 0x07;   // CAN.RXIDR1
+    i <<= 8;
+    i |= idr[2];          // CAN.RXIDR2
+    i <<= 7;
+    i |= idr[3] >> 1;     // CAN.RXIDR3
+
+    return i;
+}
+
+/*****************************************************************************/
+/* 读出CAN帧数据域，直接存入目标结构体                                       */
+/*****************************************************************************/
+static void msgcpy1 (void *to)
+{
+    *((UINT16 *)to + 0) = *(UINT16 *)&CAN1RXDSR0;
+    *((UINT16 *)to + 1) = *(UINT16 *)&CAN1RXDSR2;
+    *((UINT16 *)to + 2) = *(UINT16 *)&CAN1RXDSR4;
+    *((UINT16 *)to + 3) = *(UINT16 *)&CAN1RXDSR6;
+}
+static void msgcpy (void *to)
+{
+    *((UINT16 *)to + 0) = *(UINT16 *)&CAN4RXDSR0;
+    *((UINT16 *)to + 1) = *(UINT16 *)&CAN4RXDSR2;
+    *((UINT16 *)to + 2) = *(UINT16 *)&CAN4RXDSR4;
+    *((UINT16 *)to + 3) = *(UINT16 *)&CAN4RXDSR6;
+}
+
+/*****************************************************************************/
+/* 请求绝缘模块上送绝缘信息                                                  */
+/*****************************************************************************/
+static void GT_Ask_ISO (void)
+{
+    UINT8   tbsel;
+
+    CAN4TBSEL = CAN4TFLG;
+    tbsel = CAN4TBSEL;
+
+#define GT_ASKRT_ID 0x100f6
+
+    CAN4TXIDR0 = (UINT8)(GT_ASKRT_ID >> 21);
+    CAN4TXIDR1 = (UINT8)(((GT_ASKRT_ID >> 18) & 0x07) << 5) | ((GT_ASKRT_ID >> 15) & 0x07) | 0x18;
+    CAN4TXIDR2 = (UINT8)((GT_ASKRT_ID >> 7) & 0xff);
+    CAN4TXIDR3 = (UINT8)((GT_ASKRT_ID << 1) & 0xff);
+
+    CAN4TXDSR0 = 0x10;
+    CAN4TXDSR1 = 8;
+    CAN4TXDSR2 = 0;
+    CAN4TXDSR3 = 0;
+    CAN4TXDSR4 = 0;
+    CAN4TXDSR5 = 0;
+    CAN4TXDSR7 = 32;    // 绝缘模块ID
+
+    CAN4TXDLR  = 8;
+    CAN4TXTBPR = 0;
+    CAN4TFLG   = tbsel;
+}
+
+
+/*****************************************************************************/
+/* 请求绝缘模块上送绝缘信息                                                  */
+/*****************************************************************************/
+static void WX_Ask_ISO (void)
+{
+    UINT8   tbsel;
+
+    CAN4TBSEL = CAN4TFLG;
+    tbsel = CAN4TBSEL;
+
+#define WX_ASKRT_ID 0x100
+
+    CAN4TXIDR0 = (UINT8)( WX_ASKRT_ID >> 3 );
+    CAN4TXIDR1 = (UINT8)( (WX_ASKRT_ID & 0x00ff) << 5 );
+
+    CAN4TXDSR0 = 0x10;
+    CAN4TXDSR1 = 32;
+    CAN4TXDSR2 = 32;
+    CAN4TXDSR3 = 0;
+    CAN4TXDSR4 = 0;
+    CAN4TXDSR5 = 0;
+    CAN4TXDSR7 = 32;    // 绝缘模块ID
+
+    CAN4TXDLR  = 8;
+    CAN4TXTBPR = 0;
+    CAN4TFLG   = tbsel;
+}
+
+
+
+
+
+void CAN0_Xgate_Write (CanbusFrame *cf)
+{
+    UINT8   tbsel;
+
+    CAN0TBSEL = CAN0TFLG;
+    tbsel = CAN0TBSEL;
+
+    CAN0TXIDR0 = (UINT8)(cf->id >> 21);
+    CAN0TXIDR1 = (UINT8)(((cf->id >> 18) & 0x07) << 5) | ((cf->id >> 15) & 0x07) | 0x18;
+    CAN0TXIDR2 = (UINT8)(cf->id >> 7);
+    CAN0TXIDR3 = (UINT8)(cf->id << 1);
+
+    CAN0TXDSR0 = cf->data[0];
+    CAN0TXDSR1 = cf->data[1];
+    CAN0TXDSR2 = cf->data[2];
+    CAN0TXDSR3 = cf->data[3];
+    CAN0TXDSR4 = cf->data[4];
+    CAN0TXDSR5 = cf->data[5];
+    CAN0TXDSR6 = cf->data[6];
+    CAN0TXDSR7 = cf->data[7];
+
+    CAN0TXDLR  = cf->len;
+    CAN0TXTBPR = cf->pri;
+
+    CAN0TFLG   = tbsel;
+    while (CAN0TFLG != 0x7);
+}
+
+
+
+
+
+
+
+
+
+static void GT_Ask_LECU (void)
+{
+    UINT8   tbsel;
+    UINT32  bs = LECU_Rt[LECU_IdCur - 1].balsts;
+    UINT8   bs2 = LECU_Rt[LECU_IdCur - 1].balsts2;
+
+    CAN4TBSEL = CAN4TFLG;
+    tbsel = CAN4TBSEL;
+
+    CAN4TXIDR0 = (UINT8)(GT_ASKRT_ID >> 21);
+    CAN4TXIDR1 = (UINT8)(((GT_ASKRT_ID >> 18) & 0x07) << 5) | ((GT_ASKRT_ID >> 15) & 0x07) | 0x18;
+    CAN4TXIDR2 = (UINT8)((GT_ASKRT_ID >> 7) & 0xff);
+    CAN4TXIDR3 = (UINT8)((GT_ASKRT_ID << 1) & 0xff);
+
+    CAN4TXDSR0 = LECU_Rt[LECU_IdCur - 1].cmd;
+    CAN4TXDSR1 = bs2;
+    CAN4TXDSR2 = bs & 0xff;
+    CAN4TXDSR3 = (bs >> 8)  & 0xff;
+    CAN4TXDSR4 = (bs >> 16) & 0xff;
+    CAN4TXDSR5 = (bs >> 24) & 0xff;
+    CAN4TXDSR6 = bs2;
+    CAN4TXDSR7 = LECU_IdCur;
+
+    CAN4TXDLR  = 8;
+    CAN4TXTBPR = 0;
+    CAN4TFLG   = tbsel;
+}
+
+/*****************************************************************************/
+/* CAN4控制器接收中断服务程序 - 处理冠拓BMS内部协议                          */
+/*****************************************************************************/
+UINT8 GT_R1 (UINT32 id)
+{
+    
+    UINT8  sa = (UINT8)((id>>8) & 0xff);
+    UINT8  fs = (UINT8) id & 0xff;
+    UINT8  ps = (UINT8)((id>>16) & 0xff);
+
+    if ((sa == 0xb2)&&(ps==0xb1))      
+    {
+        if(fs<17) //16
+        {
+           msgcpy1 ((UINT8 *) &Temp_point[(fs-1)*8+fs*4]);
+        } else if(fs == 17){
+            BCU2_heart      = CAN1RXDSR0;
+            BCU2_sys_sts    = CAN1RXDSR1;  
+            Kin_BX[0]       = CAN1RXDSR3;
+            //ttttwww[1]      = *(UINT16 *) &CAN1RXDSR4; //260616
+        }
+        return 0;  
+    }
+    return 1;
+}
+/*****************************************************************************/
+/* CAN4控制器接收中断服务程序 - 处理冠拓BMS内部协议                          */
+/*****************************************************************************/
+static void GT_Rx (void)
+{
+    UINT8 i=0;
+    UINT8 j=0;
+    UINT8 num_add=0;
+    
+    UINT32 id = getEid (&CAN4RXIDR0);
+    
+    
+    
+   
+    if (LECU_Work == 0)      // (0) 正常工作模式 
+    {
+        UINT8  typ = (UINT8) id & 0xff;
+
+        id >>= 8;
+        if (typ == 0xf4 && id >= 0x110 && id < 0x400)      // 实时数据
+        {
+            UINT16  tmp;
+            UINT16  dev = (UINT16)(id - 0x110)/16;   //changed
+            UINT16  idx, limit;
+            DBDevRt *Me = &LECU_Rt[dev];
+
+            if (dev >= DEV_MAX)
+                return;
+            LECU_Age[dev] = 0;
+
+            switch (id & 0xf)
+            {
+            case 0x0: // 模块电池信息1  CAN0X110
+                    // if ((CAN4RXDSR0 & 0x7f) > DEV_CELL_MAX)
+                    //     break;
+
+                    //msgcpy ((void *) &Me->bodys);     //wjm20231010
+                     //Me->volt = (CAN4RXDSR2<<8) | CAN4RXDSR3;      //wjm20231101
+                     //Me->bodys  =LECU_NVT[dev].Cell_num|0x80;
+                     //Me->tmpnum =LECU_NVT[dev].T_num|0x80;
+                     Me->soc  = CAN4RXDSR5;
+                     Me->soh  +=1;                //用于采集状态 //wjm20231101
+                     //CAN4RXDSR0;// (CAN4RXDSR6<<8) | CAN4RXDSR7;  
+                    // Moddle_Dev = dev ;
+                    if (Cell_Temp_Indexs[dev] == 0xffff)
+                    {
+                        idx = 0;
+                        for (tmp = 0; tmp < DEV_MAX; tmp++)
+                        {
+                         //   UINT8 bodys = LECU_Rt[tmp].bodys & 0x7f;
+                            UINT8 bodys = 36;         //wjm20231010
+                            if (bodys != 0 && tmp != dev)
+                                idx += bodys;
+                        }
+
+                        if ((idx + 36) <= SYS_CELL_MAX)
+                            Cell_Temp_Indexs[dev] = (dev)*36;
+                    }
+
+                    break;
+
+            case 0x1: // 模块电池信息2+温度信息  CAN0X111
+                    //温度33~36
+                    VTemp_Middle[dev*40 + 32] = CAN4RXDSR0;
+                    VTemp_Middle[dev*40 + 33] = CAN4RXDSR1;
+                    VTemp_Middle[dev*40 + 34] = CAN4RXDSR2;
+                    VTemp_Middle[dev*40 + 35] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 36] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 37] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 38] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 39] = CAN4RXDSR3;
+                    break;
+
+            case 0x2: // 模块电池温度信息  CAN0X112
+                    //温度17~24
+                    VTemp_Middle[dev*40 + 16] = CAN4RXDSR0;
+                    VTemp_Middle[dev*40 + 17] = CAN4RXDSR1;
+                    VTemp_Middle[dev*40 + 18] = CAN4RXDSR2;
+                    VTemp_Middle[dev*40 + 19] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 20] = CAN4RXDSR4;
+                    VTemp_Middle[dev*40 + 21] = CAN4RXDSR5;
+                    VTemp_Middle[dev*40 + 22] = CAN4RXDSR6;
+                    VTemp_Middle[dev*40 + 23] = CAN4RXDSR7;
+
+                    break;
+
+            case 0x3: // 模块电池温度信息  CAN0X113
+                    //温度25~32
+                    VTemp_Middle[dev*40 + 24] = CAN4RXDSR0;
+                    VTemp_Middle[dev*40 + 25] = CAN4RXDSR1;
+                    VTemp_Middle[dev*40 + 26] = CAN4RXDSR2;
+                    VTemp_Middle[dev*40 + 27] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 28] = CAN4RXDSR4;
+                    VTemp_Middle[dev*40 + 29] = CAN4RXDSR5;
+                    VTemp_Middle[dev*40 + 30] = CAN4RXDSR6;
+                    VTemp_Middle[dev*40 + 31] = CAN4RXDSR7;
+
+                    break;
+
+            case 0x4: // LECU版本号和编号信息  CAN0X114
+                    msgcpy ((void *) &Me->swver);
+                    break;
+
+            case 0x5: // 模块温度采样点信息  CAN0X115
+                
+                   //温度1~8
+                   VTemp_Middle[dev*40 + 0] = CAN4RXDSR0;
+                   VTemp_Middle[dev*40 + 1] = CAN4RXDSR1;
+                   VTemp_Middle[dev*40 + 2] = CAN4RXDSR2;
+                   VTemp_Middle[dev*40 + 3] = CAN4RXDSR3;
+                   VTemp_Middle[dev*40 + 4] = CAN4RXDSR4;
+                   VTemp_Middle[dev*40 + 5] = CAN4RXDSR5;
+                   VTemp_Middle[dev*40 + 6] = CAN4RXDSR6;
+                   VTemp_Middle[dev*40 + 7] = CAN4RXDSR7;
+                   break;
+
+            case 0x6: // 模块温度采样点信息  CAN0X116
+                    
+                    //温度9~16
+                    VTemp_Middle[dev*40 + 8] = CAN4RXDSR0;
+                    VTemp_Middle[dev*40 + 9] = CAN4RXDSR1;
+                    VTemp_Middle[dev*40 + 10] = CAN4RXDSR2;
+                    VTemp_Middle[dev*40 + 11] = CAN4RXDSR3;
+                    VTemp_Middle[dev*40 + 12] = CAN4RXDSR4;
+                    VTemp_Middle[dev*40 + 13] = CAN4RXDSR5;
+                    VTemp_Middle[dev*40 + 14] = CAN4RXDSR6;
+                    VTemp_Middle[dev*40 + 15] = CAN4RXDSR7;
+                    break;
+
+            case 0x7: // 模块单体电压信息 CAN0X117
+            case 0x8:
+            case 0x9:
+            case 0xa:
+            case 0xb:
+            case 0xc:
+            case 0xd:
+            case 0xe:
+            case 0xf:
+                    idx = dev*36;
+                    if (idx == 0xffff)
+                        break;
+
+                    //根据CAN帧ID低四位，计算电池电压数组下标
+                   // limit = idx + (Me->bodys & 0x7f);
+                    limit = idx + 36;
+
+                    idx += ((UINT8)(id & 0xf) - 0x7) * 4;
+
+
+                    //每CAN帧最多携带4只电池电压
+                    for (tmp = 0; (tmp < 4) && (idx < limit); tmp++)
+                    {
+                        Cell_Temp_Volts[idx] = *((UINT16 *)&CAN4RXDSR0 + tmp);
+                        idx++;
+                        
+                    }
+                    break;
+            }
+       }
+        
+        if (id == 0x500)
+        {
+            Sys_Rt.relayPRE  = *(UINT16 *) &CAN4RXDSR0 ;
+            Sys_Rt.total_vol_res  = *(UINT16 *) &CAN4RXDSR2 ;
+              
+            Sys_Rt.pos_res = *(UINT16 *) &CAN4RXDSR4 ;
+           //// Sys_Rt.neg_res = *(UINT16 *) &CAN4RXDSR6;
+            Sys_Shared.iso_age = 0;
+        }
+        else if (id == 0x501)
+        {
+          
+                 
+            Sys_Shared.iso_opv = *(UINT32 *) &CAN4RXDSR0;   
+            Sys_Shared.iso_age = 0;
+                
+        }
+        else if (id == 0x502)  //绝缘模块sn
+        {
+            ISO_message.iso_sn = *(UINT32 *) &CAN4RXDSR0;
+            //ISO_message.iso_sn = 0x87654321;
+        }
+        else if (id == 0x503) //绝缘模块定制号,软件版本,硬件版本
+        {
+            ISO_message.iso_oem = *(UINT16 *) &CAN4RXDSR0;
+            ISO_message.iso_core = CAN4RXDSR2;
+            ISO_message.iso_swer = CAN4RXDSR3;
+            ISO_message.iso_hwer = *(UINT16 *) &CAN4RXDSR4;
+        }
+        else if (id == 0x504)
+        {
+            Sys_Rt.relayFAST = *(UINT16 *) &CAN4RXDSR0;
+            Sys_Rt.relaySLOW = *(UINT16 *) &CAN4RXDSR2;
+            Sys_Rt.NCNC      = *(UINT16 *) &CAN4RXDSR4;
+        }    
+        else if ((id > 0x700)&&(id<0x720))
+        {   
+            UINT16  index_12;
+               
+            index_12 = (UINT16)(id - 0x701);
+            // index_12 >>= 8;
+            LECU_Rt[index_12].in_stauts  = *(UINT32 *) &CAN4RXDSR0;
+            LECU_Rt[index_12].out_stauts  = *(UINT32 *) &CAN4RXDSR4;    
+        } 
+    
+    }
+    else
+    
+     if (LECU_Work == 3)  /* (3) 采集器下载程序模式，将CAN帧数据部分转发到485总线 */
+    {
+        unsigned i;
+
+        SCI0CR2_TCIE = 0;
+        for (i = 0; i < 8; i++)
+        {
+          UINT8 ch = *((UINT8 *)&CAN4RXDSR0 + i);
+
+          if (!txBusy)
+          {
+              txBusy = TRUE;
+
+              PTS_PTS4 = 1;                         /* 485收发器 - 发送 */
+              SCI0DRL = ch;
+          }
+          else
+          {
+              txBuf[txWptr] = ch;
+              txWptr = (txWptr + 1) & (BUFSZ - 1);
+          }
+        }
+        SCI0CR2_TCIE = 1;
+    }
+    else if ((CAN4RXDLR & 0xF) >= 5 &&
+        (id & 0x0FFFFFFF) == (*(UINT32 *)&CAN4RXDSR0 & 0x0FFFFFFF)) /* (1) 或 (2) 搜索采集板模式 */
+    {
+        UINT32  sn = *(UINT32 *)&CAN4RXDSR0;
+        UINT8   i;
+
+        /*首先查看SN是否已经存在*/
+        for (i = 0; i < LECU_SnNum; i++)
+        if (LECU_SnList[i] == sn)
+          break;
+
+        /*如果不存在，插入列表*/
+        if (i == LECU_SnNum && i < DEV_MAX)
+        {
+            LECU_IdList[LECU_SnNum] = CAN4RXDSR4;
+            LECU_SnList[LECU_SnNum] = sn;
+
+            LECU_SnNum++;
+        }
+    }
+}
+
+/*****************************************************************************/
+/* CAN4控制器接收中断服务程序 - 处理万向BMS内部协议                          */
+/*****************************************************************************/
+#if PTL_QDWX
+static void WX_Ask_LECU (void)
+{
+    UINT8   tbsel;
+    UINT32  bs = LECU_Rt[QDWX_IdCur - 1].balsts;
+
+    CAN4TBSEL = CAN4TFLG;
+    tbsel = CAN4TBSEL;
+
+#define ASKRT_ID    0x100
+    CAN4TXIDR0 = (UINT8)( ASKRT_ID >> 3 );
+    CAN4TXIDR1 = (UINT8)( (ASKRT_ID & 0x00ff) << 5 );
+
+    CAN4TXDSR0 = LECU_Rt[QDWX_IdCur - 1].cmd | 0x10;//1---- non-sleep;0---- sleep// to be continue....... 参见内网协议
+    CAN4TXDSR1 = QDWX_IdCur;
+    CAN4TXDSR2 = bs & 0xff;           //均衡控制
+    CAN4TXDSR3 = (bs >> 8)  & 0xff;
+    CAN4TXDSR4 = (bs >> 16) & 0xff;
+    CAN4TXDSR5 = 0;//保留
+    CAN4TXDSR6 = 0;
+    CAN4TXDSR7 = 0;
+
+    CAN4TXDLR  = 8;
+    CAN4TXTBPR = 0;
+    CAN4TFLG   = tbsel;
+}
+
+static void WX_Rx (void)
+{
+    CanbusFrame *cf = &CAN4_RxBuf[CAN4_RxWPtr];
+    UINT16 id = (CAN4RXIDR0 << 3) | (CAN4RXIDR1 >> 5);
+
+    if( id == 0x31 || id == 0x30 || id == 0x33)
+    {
+        cf->id = id;
+        cf->pri = 0;
+        cf->len = CAN4RXDLR & 0xF;
+
+        cf->data[0] = CAN4RXDSR0;
+        cf->data[1] = CAN4RXDSR1;
+        cf->data[2] = CAN4RXDSR2;
+        cf->data[3] = CAN4RXDSR3;
+        cf->data[4] = CAN4RXDSR4;
+        cf->data[5] = CAN4RXDSR5;
+        cf->data[6] = CAN4RXDSR6;
+        cf->data[7] = CAN4RXDSR7;
+
+        /*存入CAN1接收缓冲区，待协议模块处理或被丢弃*/
+        CAN4_RxWPtr = (CAN4_RxWPtr + 1) & (CAN4_RXBSZ - 1);
+    }
+    if (id >= 0x110 && id < 0x300)
+    {
+        UINT16  tmp;
+        UINT16  dev = (UINT16)(id - 0x110)/16;
+        UINT16  idx, limit;
+        DBDevRt *Me = &LECU_Rt[dev];
+
+        if (dev >= DEV_MAX)
+            return;
+
+
+        LECU_Valids |= 1UL << dev;
+        LECU_Age[dev] = 0;
+        lecutick[dev] = gSysTicks;
+
+        switch (id & 0xf)
+        {
+        case 0x0: // 模块电池信息1  CAN0X110
+                if ((CAN4RXDSR0 & 0x7f) > DEV_CELL_MAX)
+                    break;
+
+                msgcpy ((void *) &Me->bodys);
+
+                if (Cell_Indexs[dev] == 0xffff)
+                {
+                    idx = 0;
+                    for (tmp = 0; tmp < DEV_MAX; tmp++)
+                    {
+                        UINT8 bodys = LECU_Rt[tmp].bodys & 0x7f;
+
+                        if (bodys != 0 && tmp != dev)
+                            idx += bodys;
+                    }
+
+                    if (idx + (Me->bodys & 0x7f) <= SYS_CELL_MAX)
+                        Cell_Indexs[dev] = idx;
+                }
+                break;
+
+        case 0x1: // 模块电池信息2  CAN0X111
+                msgcpy ((void *) &Me->itmp);
+                break;
+
+        case 0x2: // 模块电池电压信息  CAN0X112
+                Me->maxv    = *(UINT16 *) &CAN4RXDSR0;
+                Me->maxvnr  = CAN4RXDSR2;
+
+                tmp  = CAN4RXDSR3<<8;
+                tmp |= CAN4RXDSR4;
+                Me->minv   = tmp;
+                Me->minvnr = CAN4RXDSR5;
+
+                Me->avv =  *(UINT16 *) &CAN4RXDSR6;
+                break;
+
+        case 0x3: // 模块电池温度信息  CAN0X113
+                //msgcpy ((void *) &Me->maxtmp);
+                {
+                  UINT16 maxt=0,mint=0,avt=0;
+                  UINT8  maxtnr=0,mintnr=0;
+
+                  maxt    = *(UINT16 *) &CAN4RXDSR0;
+                  maxtnr  = CAN4RXDSR2;
+                  mint    = (CAN4RXDSR3<<8)|CAN4RXDSR4;
+                  mintnr  = CAN4RXDSR5;
+                  avt     = (CAN4RXDSR6<<8)|CAN4RXDSR7;
+
+                  Me->maxtmp    = (UINT8)((maxt&0x7fff)/10);
+                  Me->maxtmpnr  = maxtnr;
+                  Me->mintmp    = (UINT8)((mint&0x7fff)/10);
+                  Me->mintmpnr  = mintnr;
+                  Me->avtmp     = (UINT8)((avt&0x7fff)/10);
+
+                }
+                break;
+
+        case 0x4: // LECU版本号和编号信息  CAN0X114
+                msgcpy ((void *) &Me->swver);
+                break;
+
+        case 0x5: // 模块温度采样点信息1  CAN0X115
+                //msgcpy ((void *) &Me->tmps);
+                Me->tmps[0] = (UINT8)(((*(UINT16 *)&CAN4RXDSR0) & 0x7fff) / 10);
+                Me->tmps[1] = (UINT8)(((*(UINT16 *)&CAN4RXDSR2) & 0x7fff) / 10);
+                Me->tmps[2] = (UINT8)(((*(UINT16 *)&CAN4RXDSR4) & 0x7fff) / 10);
+                Me->tmps[3] = (UINT8)(((*(UINT16 *)&CAN4RXDSR6) & 0x7fff) / 10);
+
+                break;
+
+        case 0x6: // 模块温度采样点信息2  CAN0X116
+                //msgcpy ((UINT8 *) &Me->tmps + 8);
+                Me->tmps[4] = (UINT8)(((*(UINT16 *)&CAN4RXDSR0) & 0x7fff) / 10);
+                Me->tmps[5] = (UINT8)(((*(UINT16 *)&CAN4RXDSR2) & 0x7fff) / 10);
+                Me->tmps[6] = (UINT8)(((*(UINT16 *)&CAN4RXDSR4) & 0x7fff) / 10);
+                Me->tmps[7] = (UINT8)(((*(UINT16 *)&CAN4RXDSR6) & 0x7fff) / 10);
+                break;
+
+        case 0x7: // 模块单体电压信息 CAN0X117
+        case 0x8:
+        case 0x9:
+        case 0xa:
+        case 0xb:
+        case 0xc:
+        case 0xd:
+        case 0xe:
+        case 0xf:
+                idx = Cell_Indexs[dev];
+                if (idx == 0xffff)
+                    break;
+
+                /*根据CAN帧ID低四位，计算电池电压数组下标*/
+                limit = idx + (Me->bodys & 0x7f);
+                idx += ((UINT16)(id & 0xf) - 0x7) * 4;
+
+                /*每CAN帧最多携带4只电池电压*/
+                for (tmp = 0; tmp < 4 && idx < limit; tmp++)
+                {
+                    Cell_Volts[idx] = *((UINT16 *)&CAN4RXDSR0 + tmp);
+                    idx++;
+                }
+                //msgcpy ((UINT8 *) &Cell_Volts[idx] + tmp*8);
+                break;
+        }
+    }
+   if (id == 0x500)
+    {
+                  Sys_Rt.relayPRE  = *(UINT16 *) &CAN4RXDSR0 ;
+                  Sys_Rt.total_vol_res  = *(UINT16 *) &CAN4RXDSR2 ;
+              
+                Sys_Rt.pos_res = *(UINT16 *) &CAN4RXDSR4 ;
+                Sys_Rt.neg_res = *(UINT16 *) &CAN4RXDSR6 ;
+                Sys_Shared.iso_age = 0;
+                
+    }
+   else if (id == 0x501)
+            {
+               
+                Sys_Shared.iso_opv = *(UINT32 *) &CAN4RXDSR0;
+                Sys_Shared.iso_age = 0;
+                
+                
+            }
+            else if (id == 0x502)  //绝缘模块sn
+        {
+            ISO_message.iso_sn = *(UINT32 *) &CAN4RXDSR0;
+        }
+        else if (id == 0x503) //绝缘模块定制号,软件版本,硬件版本
+        {
+            ISO_message.iso_oem = *(UINT16 *) &CAN4RXDSR0;
+            ISO_message.iso_core = CAN4RXDSR2;
+            ISO_message.iso_swer = CAN4RXDSR3;
+            ISO_message.iso_hwer = *(UINT16 *) &CAN4RXDSR4;
+        }
+   
+    if((id>0x700)&&(id<0x720))////
+     {
+              UINT8 index_12 = 0;
+               index_12 = (id - 0x701);
+               LECU_Rt[index_12].in_stauts  = *(UINT32 *) &CAN4RXDSR0 ;
+               LECU_Rt[index_12].out_stauts  =  *(UINT32 *) &CAN4RXDSR4 ;
+               
+     }
+    
+}
+#endif
+
+static void CAN4ToCAN0 (void)
+{
+    UINT8   tbsel;
+
+    CAN0TBSEL = CAN0TFLG;       /* 将CAN4收到的所有报文，整个转发到CAN0 */
+    tbsel = CAN0TBSEL;
+
+    CAN0TXIDR0 = CAN4RXIDR0;
+    CAN0TXIDR1 = CAN4RXIDR1;
+    CAN0TXIDR2 = CAN4RXIDR2;
+    CAN0TXIDR3 = CAN4RXIDR3;
+
+    CAN0TXDSR0 = CAN4RXDSR0;
+    CAN0TXDSR1 = CAN4RXDSR1;
+    CAN0TXDSR2 = CAN4RXDSR2;
+    CAN0TXDSR3 = CAN4RXDSR3;
+    CAN0TXDSR4 = CAN4RXDSR4;
+    CAN0TXDSR5 = CAN4RXDSR5;
+    CAN0TXDSR6 = CAN4RXDSR6;
+    CAN0TXDSR7 = CAN4RXDSR7;
+
+    CAN0TXDLR  = CAN4RXDLR;
+    CAN0TXTBPR = 0;
+    CAN0TFLG   = tbsel;
+}
+
+static void CAN0ToCAN4 (void)
+{
+    UINT8   tbsel;
+
+    CAN4TBSEL = CAN4TFLG;       /* 将CAN0收到的所有报文，整个转发到CAN4 */
+    tbsel = CAN4TBSEL;
+
+    CAN4TXIDR0 = CAN0RXIDR0;
+    CAN4TXIDR1 = CAN0RXIDR1;
+    CAN4TXIDR2 = CAN0RXIDR2;
+    CAN4TXIDR3 = CAN0RXIDR3;
+
+    CAN4TXDSR0 = CAN0RXDSR0;
+    CAN4TXDSR1 = CAN0RXDSR1;
+    CAN4TXDSR2 = CAN0RXDSR2;
+    CAN4TXDSR3 = CAN0RXDSR3;
+    CAN4TXDSR4 = CAN0RXDSR4;
+    CAN4TXDSR5 = CAN0RXDSR5;
+    CAN4TXDSR6 = CAN0RXDSR6;
+    CAN4TXDSR7 = CAN0RXDSR7;
+
+    CAN4TXDLR  = CAN0RXDLR;
+    CAN4TXTBPR = 0;
+    CAN4TFLG   = tbsel;
+}
+static void CAN1ToCAN0 (void)
+{
+    UINT8   tbsel;
+
+    CAN0TBSEL = CAN0TFLG;       /* 将CAN4收到的所有报文，整个转发到CAN0 */
+    tbsel = CAN0TBSEL;
+
+    CAN0TXIDR0 = CAN1RXIDR0;
+    CAN0TXIDR1 = CAN1RXIDR1;
+    CAN0TXIDR2 = CAN1RXIDR2;
+    CAN0TXIDR3 = CAN1RXIDR3;
+
+    CAN0TXDSR0 = CAN1RXDSR0;
+    CAN0TXDSR1 = CAN1RXDSR1;
+    CAN0TXDSR2 = CAN1RXDSR2;
+    CAN0TXDSR3 = CAN1RXDSR3;
+    CAN0TXDSR4 = CAN1RXDSR4;
+    CAN0TXDSR5 = CAN1RXDSR5;
+    CAN0TXDSR6 = CAN1RXDSR6;
+    CAN0TXDSR7 = CAN1RXDSR7;
+
+    CAN0TXDLR  = CAN1RXDLR;
+    CAN0TXTBPR = 0;
+    CAN0TFLG   = tbsel;
+}
+/*****************************************************************************/
+/* CAN4控制器接收中断服务程序                                                */
+/*****************************************************************************/
+interrupt void Can4Rx_Handle(void)
+{
+  //UINT32  index_12;
+  //  CAN4ToCAN0 ();
+    if (BCU_Update || BCU_Transport)
+    {
+        //CAN4ToCAN0 ();
+    }
+    else
+    {
+        //扩展帧 //
+        if (CAN4RXIDR1 & 0x08)
+        {
+            GT_Rx ();
+        }
+
+        #if PTL_QDWX
+        if (!(CAN4RXIDR1 & 0x08))   /* 标准帧 */
+          WX_Rx ();  //
+        #endif
+
+        // 扩展帧//
+        if (CAN4RXIDR1 & 0x08)
+        {
+            UINT32 id = getEid (&CAN4RXIDR0);
+
+            if (((UINT8) id & 0xff) == 0xf6)      // 模块参数
+            {
+                UINT8 grp = (id >> 8) & 0xf;
+
+                if (grp >= 1 && grp <= 6)
+                {
+                    TempDevGot |= 1 << (grp - 1);
+                    msgcpy (&TempDevPara.coltd + (grp - 1)*8);
+                }
+            }
+           
+        }
+        else
+        {
+            UINT16 id = (CAN4RXIDR0 << 3) | (CAN4RXIDR1 >> 5);
+
+            if (id == 0x555 || id == 0x31 || id == 0x30)
+            {
+                CanbusFrame *cf = &CAN4_RxBuf[CAN4_RxWPtr];
+
+                cf->id = id;
+                cf->pri = 0;
+                cf->len = CAN4RXDLR & 0xF;
+                cf->data[0] = CAN4RXDSR0;
+                cf->data[1] = CAN4RXDSR1;
+                cf->data[2] = CAN4RXDSR2;
+                cf->data[3] = CAN4RXDSR3;
+                cf->data[4] = CAN4RXDSR4;
+                cf->data[5] = CAN4RXDSR5;
+                cf->data[6] = CAN4RXDSR6;
+                cf->data[7] = CAN4RXDSR7;
+
+                //存入CAN1接收缓冲区，待协议模块处理或被丢弃//
+                CAN4_RxWPtr = (CAN4_RxWPtr + 1) & (CAN4_RXBSZ - 1);
+            }
+        }
+    }
+
+    //Release RxBuf//
+    CAN4RFLG = 0x01;
+}
+
+/*****************************************************************************/
+/* KWP2000协议处理，主要完成采集板软件升级功能                               */
+/*****************************************************************************/
+static BOOL KWP2000_Rx (void)
+{
+    BOOL    start = FALSE;
+    UINT16  id = (CAN0RXIDR0 << 3) | (CAN0RXIDR1 >> 5);
+
+    //特殊报文处理//
+    if (id == 0x555 && CAN0RXDLR == 8)
+    {
+      if (CAN0RXDSR0 == 0xde && CAN0RXDSR1 == 0xad && CAN0RXDSR2 == 'H' && CAN0RXDSR3 == 'C' && CAN0RXDSR4 == '0'/* && CAN0RXDSR5 == '8'*/)
+      {
+          //开始给采集板下载软件//
+          start = TRUE;
+      }
+      else
+      {
+          //终止给采集板下载软件//
+          PITINTE_PINTE3 = 1;
+          BCU_Update = FALSE;
+          BCU_Transport = FALSE;
+
+          return FALSE;
+      }
+    }
+    else if (id == 0x789)
+    {
+        PITINTE_PINTE3 = 0;         //PIT中断关闭,停止采集板数据招测//
+        BCU_Transport = TRUE;
+
+        CAN0ToCAN4 ();
+
+        //Release RxBuf//
+        CAN0RFLG = 0x01;
+
+        return TRUE;
+    }
+
+    if (BCU_Update || start)
+    {
+        PITINTE_PINTE3 = 0;         //PIT中断关闭,停止采集板数据招测///
+
+        CAN0ToCAN4 ();
+
+       //按KWP2000链路层协议，替采集板恢复应答报?//
+        if (BCU_Update)
+        {
+          static UINT16 CanBytes;
+          static BOOL   CanFF;
+          static UINT8  MySN;
+          static UINT16 CanPos;
+          UINT8         CanSN;
+
+          switch (CAN0RXDSR0 & 0xf0)
+          {
+          case 0x00:    // Single Frame (SF)
+              break;
+
+          case 0x10:    // First Frame (FF)
+              CanBytes = ((CAN0RXDSR0 & 0xF) << 8) | CAN0RXDSR1;
+              CanFF = TRUE;
+              MySN = 0;
+              CanPos = 6;
+
+Ack:          CAN0TBSEL = 0x1;
+              CAN0TXIDR0 = CAN0RXIDR0;
+              CAN0TXIDR1 = CAN0RXIDR1;
+
+              CAN0TXDSR0 = 0x30 | 0x0;//ContinueToSend//;
+              CAN0TXDSR1 = MySN;
+              CAN0TXDSR2 = 0xf5;//STmin//;
+              CAN0TXDLR  = 3;
+              CAN0TFLG = 0x1;
+              break;
+
+          case 0x20:    // Consecutive Frame (CF)
+              if (!CanFF)
+                break;
+
+              CanSN = CAN0RXDSR0 & 0xF;
+              if (CanSN != MySN)
+              {
+                  goto Ack;
+              }
+
+              MySN = (MySN + 1) & 0xF;
+
+              CanPos += CAN0RXDLR - 1;
+              if (CanPos >= CanBytes)
+              {
+                  CanFF = 0;
+                  MySN = 0;
+                  goto Ack;
+              }
+          }
+        }
+
+        //Release RxBuf//
+        CAN0RFLG = 0x01;
+
+        BCU_Update = TRUE;
+        return TRUE;
+    }
+    
+    
+    return FALSE;
+}
+ 
+/*****************************************************************************/
+/* CAN0控制器接受中断服务程序                                                */
+/*****************************************************************************/
+interrupt void Can0Rx_Handle(void)
+{
+    UINT8   np = (CAN0_RxWPtr + 1) & (CAN0_RXBSZ - 1);
+
+    if (!(CAN0RXIDR1 & 0x08)&& KWP2000_Rx () )
+      return;
+
+    if (np != CAN0_RxRPtr)
+    {
+        CanbusFrame *cf = &CAN0_RxBuf[CAN0_RxWPtr];
+    
+        if (!(CAN0RXIDR1 & 0x08))
+        {
+            /* 标准帧 */
+    
+            cf->id = (CAN0RXIDR0 << 3) | (CAN0RXIDR1 >> 5);
+        }
+        else
+        {
+            /* 扩展帧 */
+    
+            cf->id = getEid (&CAN0RXIDR0);
+        }
+    
+        cf->pri = 0;
+        cf->len = CAN0RXDLR & 0xF;
+        cf->data[0] = CAN0RXDSR0;
+        cf->data[1] = CAN0RXDSR1;
+        cf->data[2] = CAN0RXDSR2;
+        cf->data[3] = CAN0RXDSR3;
+        cf->data[4] = CAN0RXDSR4;
+        cf->data[5] = CAN0RXDSR5;
+        cf->data[6] = CAN0RXDSR6;
+        cf->data[7] = CAN0RXDSR7;
+    
+        /*存入CAN0接收缓冲区，待协议模块处理或被丢弃*/
+        CAN0_RxWPtr = np;
+    }
+
+    /*Release RxBuf*/
+    CAN0RFLG = 0x01;
+}
+/*
+interrupt void Can0Rx_Handle(void)
+{
+    UINT8 i = 0;
+
+    UINT32 id = getEid (&CAN0RXIDR0);
+    CanbusFrame sf;
+    switch(id) {
+        case CAN_R_STP1:
+        case CAN_R_STP2:
+        //   if(OTA_RecStop_flag==0){
+             OTA_RecStop_flag  = 0x01; 
+             R_STP1_len = *(UINT16 *) &CAN0RXDSR0;
+             R_STP1_add = *(UINT16 *) &CAN0RXDSR2;
+        //   }
+            sf.id = CAN_R_REC1;
+            sf.pri = 1;
+            sf.len = 8;
+
+            sf.data[0] = R_STP1_len>>8;
+            sf.data[1] = R_STP1_len;
+            sf.data[2] = 0;
+            sf.data[3] = 0;
+            sf.data[4] = R_STP1_add>>8;
+            sf.data[5] = R_STP1_add;
+            sf.data[6] = 0;
+            sf.data[7] = 0;
+            CAN0_Xgate_Write(&sf);
+            sum_ota = 0 ;
+        
+           
+        break;
+        default:
+            if((((id & 0x1fffff00)==CAN_R_ADD1)||((id & 0x1fffff00)==CAN_R_ADD2))&&(OTA_RecStop_flag==0)) {
+             // if((((id & 0x1fffff00)==CAN_R_ADD1)||((id & 0x1fffff00)==CAN_R_ADD2))) {
+              UINT8  typ = ((UINT8)id);
+              OTA_can_buf[typ*8+0] =CAN0RXDSR0;
+              OTA_can_buf[typ*8+1] =CAN0RXDSR1;
+              OTA_can_buf[typ*8+2] =CAN0RXDSR2;
+              OTA_can_buf[typ*8+3] =CAN0RXDSR3;
+              OTA_can_buf[typ*8+4] =CAN0RXDSR4;
+              OTA_can_buf[typ*8+5] =CAN0RXDSR5;
+              OTA_can_buf[typ*8+6] =CAN0RXDSR6;
+              OTA_can_buf[typ*8+7] =CAN0RXDSR7;
+              OTA_Rec_flag |= (0x01<<typ);
+              for(i=0;i<8;i++) {
+                sum_ota += OTA_can_buf[typ*8+i];
+              }
+            }else{
+              UINT8   np = (CAN0_RxWPtr + 1) & (CAN0_RXBSZ - 1);
+
+              if (np != CAN0_RxRPtr)
+              {
+              CanbusFrame *cf = &CAN0_RxBuf[CAN0_RxWPtr];
+
+              if (!(CAN0RXIDR1 & 0x08))
+              {
+              //标准帧 
+
+              cf->id = (CAN0RXIDR0 << 3) | (CAN0RXIDR1 >> 5);
+              }
+              else
+              {
+              //扩展帧 
+
+              cf->id = getEid (&CAN0RXIDR0);
+              }
+
+              cf->pri = 0;
+              cf->len = CAN0RXDLR & 0xF;
+              cf->data[0] = CAN0RXDSR0;
+              cf->data[1] = CAN0RXDSR1;
+              cf->data[2] = CAN0RXDSR2;
+              cf->data[3] = CAN0RXDSR3;
+              cf->data[4] = CAN0RXDSR4;
+              cf->data[5] = CAN0RXDSR5;
+              cf->data[6] = CAN0RXDSR6;
+              cf->data[7] = CAN0RXDSR7;
+
+              //存入CAN0接收缓冲区，待协议模块处理或被丢弃
+              CAN0_RxWPtr = np;
+              }
+            }
+            
+        break;
+    }
+    
+
+    
+
+    //Release RxBuf
+    CAN0RFLG = 0x01;   
+}
+*/
+/*****************************************************************************/
+/* CAN1控制器接受中断服务程序                                                */
+/*****************************************************************************/
+/*interrupt void Can1Rx_Handle(void)
+{
+    UINT8   np = (CAN1_RxWPtr + 1) & (CAN1_RXBSZ - 1);
+   // CAN1ToCAN0();
+    if (np != CAN1_RxRPtr)
+    {
+        CanbusFrame *cf = &CAN1_RxBuf[CAN1_RxWPtr];
+
+        if (!(CAN1RXIDR1 & 0x08))//标准帧
+        {
+            cf->id = (CAN1RXIDR0 << 3) | (CAN1RXIDR1 >> 5);
+        }
+        else //扩展帧
+        {
+            cf->id = getEid (&CAN1RXIDR0);
+        }
+
+        cf->pri = 0;
+        cf->len = CAN1RXDLR & 0xF;
+
+        cf->data[0] = CAN1RXDSR0;
+        cf->data[1] = CAN1RXDSR1;
+        cf->data[2] = CAN1RXDSR2;
+        cf->data[3] = CAN1RXDSR3;
+        cf->data[4] = CAN1RXDSR4;
+        cf->data[5] = CAN1RXDSR5;
+        cf->data[6] = CAN1RXDSR6;
+        cf->data[7] = CAN1RXDSR7;
+
+        //存入CAN1接收缓冲区，待协议模块处理或被丢弃
+        CAN1_RxWPtr = np;
+    }
+
+    CAN1RFLG = 0x01;
+    
+
+} */
+interrupt void Can1Rx_Handle(void)
+{
+    UINT8 com_flag = 1;
+    //扩展帧 //
+    //CAN1ToCAN0();
+    if (CAN1RXIDR1 & 0x08)
+    {
+       com_flag =  GT_R1 (getEid (&CAN1RXIDR0));
+    }
+    if(com_flag == 1) {
+        
+        CanbusFrame *cf = &CAN1_RxBuf[CAN1_RxWPtr];
+        //CAN4ToCAN0();
+        if (!(CAN1RXIDR1 & 0x08))//标准帧
+        {
+            cf->id = (CAN1RXIDR0 << 3) | (CAN1RXIDR1 >> 5);
+        }
+        else //扩展帧
+        {
+            cf->id = getEid (&CAN1RXIDR0);
+        }
+        cf->pri     = 0;
+        cf->len     = CAN1RXDLR & 0xF;
+        cf->data[0] = CAN1RXDSR0;
+        cf->data[1] = CAN1RXDSR1;
+        cf->data[2] = CAN1RXDSR2;
+        cf->data[3] = CAN1RXDSR3;
+        cf->data[4] = CAN1RXDSR4;
+        cf->data[5] = CAN1RXDSR5;
+        cf->data[6] = CAN1RXDSR6;
+        cf->data[7] = CAN1RXDSR7;
+
+        //存入CAN4接收缓冲区，待协议模块处理或被丢弃//
+        CAN1_RxWPtr = (CAN1_RxWPtr + 1) & (CAN1_RXBSZ - 1);
+    }
+    CAN1RFLG = 0x01; 
+}
+
+/*****************************************************************************/
+/* SPI控制器收发函数                                                         */
+/*****************************************************************************/
+UINT8 SPI2_Send_Receve (UINT8 data)
+{
+    UINT8 temp;
+    while (!SPI2SR_SPTEF);
+    SPI2DR = data;
+
+    while (!SPI2SR_SPIF);
+    temp = SPI2DR;
+    return temp;
+}
+
+/*****************************************************************************/
+/* 读整车总电流                                                              */
+/*****************************************************************************/
+UINT16 ads1146_ad (void)
+{
+    UINT8 x,y,jj;
+
+    PTP_PTP6 = 0;
+    for(jj=0;jj<50;jj++)
+      _FEED_COP(); /* feeds the dog */    //busclk:32MHz--.18s
+
+    (void) SPI2_Send_Receve(0x12);
+
+    for (jj = 0; jj < 50; jj++)
+      _FEED_COP(); /* feeds the dog */    //busclk:32MHz--.18s
+
+    x = SPI2_Send_Receve (0x55);
+    y = SPI2_Send_Receve (0x55);
+    PTP_PTP6 = 1;
+
+    return ((UINT16)x << 8) | y;
+
+}
+
+static UINT8    DsIdx = 0;
+static SINT16   Array[5] = {0,0,0,0,0};
+static SINT16   TmpBuf[5];
+
+/*****************************************************************************/
+/* 10ms软件中断服务程序                                                      */
+/*****************************************************************************/
+interrupt void SoftwareTrigger0_Handler(void)
+{
+    UINT8   i;
+    UINT32  DIVVV= 0;//存储累计个数
+    UINT32  ams_2000_pos = 0;//存储累计个数
+    SINT16  cur;
+
+    Array[DsIdx] = (SINT16)ads1146_ad();
+    DsIdx = (DsIdx == 4) ? 0 : (UINT8)(DsIdx + 1);
+
+    for (i = 0; i < 5; i++)
+        TmpBuf[i] = Array[i];
+
+#define CHECK_SWAP(a,b) if (TmpBuf[a] < TmpBuf[b]) {SINT16 t = TmpBuf[a]; TmpBuf[a] = TmpBuf[b]; TmpBuf[b] = t; }
+
+    for (i = 1; i < 5; i++) CHECK_SWAP (i, 0)
+    for (i = 2; i < 5; i++) CHECK_SWAP (i, 1)
+    for (i = 3; i < 5; i++) CHECK_SWAP (i, 2)
+
+    //cur = (SINT16)((SINT32)TmpBuf[2] * OEM_Para.hallpara / 10000);  //单位为0.1A
+    
+    cur = TmpBuf[2] / 10;             // TmpBuf是经过电阻和放大倍数处理后的电压值,其值等同电流值
+//       cur = 1000;
+    Sys_Shared.C0_Raw = cur;                             // ADC计算的电流值
+    
+    cur -= OEM_Para.c0;                       // 去零漂
+
+    Sys_Shared.CurrentRaw = cur;                         // 去零漂后的电流值
+    
+    cur = (SINT16)((SINT32)cur * OEM_Para.Ref / OEM_Para.Raw * OEM_Para.hallpara / 1000);
+    if((cur<10)&&(cur>-10)) cur = 0; 
+//    cur = 1000;
+//////////////////////////////////////////////////////////////////////////////
+//        OEM_Para.cur_dir;        //0x00 正电流soc减少   0x01 正电流soc增加 \\0x80   调换霍尔方向 \\0x00  正电流放电报警  ，
+
+//////////////////////////////////////////////////////////////////////////////    
+  if(OEM_Para.cur_dir&0x80) //调换霍尔方向
+   
+     cur = -cur;
+
+  asm LOOP1: SSEM #0
+  asm BCC LOOP1
+ 
+  if(OEM_Para.cur_dir&0x01)
+  {
+       //放电为负   电流〈0  soc下烬    
+       Sys_Rt.ams_2000 += cur;     // soc下降
+  } 
+  else
+  {
+       //放电为正   电流>0  soc下降  
+      Sys_Rt.ams_2000 -= cur;     // soc下降
+  }
+  if(Sys_Rt.ams_2000 >= 2000 ) //2000 *10 /25 Sys_Rt.Ams 按照0.0006的soc计算分辨率（满足0.06的soc）最小分辨单位为2180ams
+   {
+      
+      DIVVV  =  Sys_Rt.ams_2000 / 2000;//Sys_Rt.Ams 按照0.0006的soc计算分辨率（满足0.06的soc）最小分辨单位为2180ams
+      Sys_Rt.TKAms +=  DIVVV  ;
+      Sys_Rt.ams_2000 -= DIVVV*2000;
+      
+   }
+   if(Sys_Rt.ams_2000 <= -2000) //Sys_Rt.Ams 按照0.0006的soc计算分辨率（满足0.06的soc）最小分辨单位为2180ams
+   {
+      
+      ams_2000_pos = 0 -Sys_Rt.ams_2000; 
+      DIVVV  =  ams_2000_pos / 2000;//Sys_Rt.Ams 按照0.0006的soc计算分辨率（满足0.06的soc）最小分辨单位为2180ams
+      Sys_Rt.TKAms -=  DIVVV  ;
+      Sys_Rt.ams_2000 += DIVVV*2000;
+      
+   }   
+  
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////       
+asm CSEM #0   
+
+    Sys_Shared.cur  = cur;                    //单位为0.1A
+
+    XGSWT = 0x0100;
+    
+    
+     
+}
+
+/*****************************************************************************/
+/* 21ms定时器中断服务程序                                                    */
+/*****************************************************************************/
+interrupt void PIT_Handler(void)
+{
+
+
+    PITTF = 8;
+    /* 发送FIFO满 */
+    CAN4TFLG = 1;
+    //if (CAN4TFLG == 0x0)
+    //    return;
+
+
+
+
+
+#if PTL_QDWX
+    //if (LECU_IdCur == 1)  // 与GT模式共存时
+    //{
+    //    WX_Ask_LECU ();
+    //
+    //    QDWX_IdCur++;
+    //    if (QDWX_IdCur > Sys_Para.lecu_num)
+    //        QDWX_IdCur = 1;
+    //}
+
+
+
+    #if PTL_HAVE_ISO
+    if (Sys_Shared.iso_req)
+    {
+        Sys_Shared.iso_req = FALSE;
+       WX_Ask_ISO ();
+        
+      
+        return;
+    }
+#endif
+  
+  
+    if (QDWX_IdCur <= Sys_Para.lecu_num)
+        WX_Ask_LECU ();
+
+    QDWX_IdCur++;
+    if (QDWX_IdCur > 40)
+        QDWX_IdCur = 1;
+#endif
+
+#if PTL_LECU                // 与QDWX模式共存时取消宏编译
+
+
+    GT_Ask_LECU ();
+    
+    #if PTL_HAVE_ISO
+    if (Sys_Shared.iso_req)
+    {
+        Sys_Shared.iso_req = FALSE;       
+       
+       GT_Ask_ISO();
+      
+        return;
+    }
+#endif
+    
+    
+#endif
+
+    LECU_IdCur++;
+    if (LECU_IdCur > Sys_Para.lecu_num)
+    {
+        LECU_IdCur = 1;
+        Sys_Shared.ask++;
+    }
+}
+
+
+/*****************************************************************************/
+/* 保护流程300ms中断                                                         */
+/*****************************************************************************/
+interrupt void  PROTECT_Handler(void)
+{
+    
+     PITTF_PTF2 = 1;     //清中断
+     Prot_Timer++;
+   
+}
+
+// interrupt handler for all others
+interrupt void ErrorHandler(int dataptr)
+{
+  int chanNum = dataptr;
+  asm BRK;
+}
+
+#pragma CONST_SEG XGATE_VECTORS  /* assign the vector table in separate segment for dedicated placement in linker parameter file */
+const XGATE_TableEntry XGATE_VectorTable[] = {
+                         // Channel # = Vector address / 2
+  /* channel 0..8 are not used, first used must match macro XGATE_VECTOR_OFFSET in xgate.h */
+  {ErrorHandler, 0x09},  // Channel 09 - Reserved
+  {ErrorHandler, 0x0A},  // Channel 0A - Reserved
+  {ErrorHandler, 0x0B},  // Channel 0B - Reserved
+  {ErrorHandler, 0x0C},  // Channel 0C - Reserved
+  {ErrorHandler, 0x0D},  // Channel 0D - Reserved
+  {ErrorHandler, 0x0E},  // Channel 0E - Reserved
+  {ErrorHandler, 0x0F},  // Channel 0F - Reserved
+  {ErrorHandler, 0x10},  // Channel 10 - Reserved
+  {ErrorHandler, 0x11},  // Channel 11 - Reserved
+  {ErrorHandler, 0x12},  // Channel 12 - Reserved
+  {ErrorHandler, 0x13},  // Channel 13 - Reserved
+  {ErrorHandler, 0x14},  // Channel 14 - Reserved
+  {ErrorHandler, 0x15},  // Channel 15 - Reserved
+  {ErrorHandler, 0x16},  // Channel 16 - Reserved
+  {ErrorHandler, 0x17},  // Channel 17 - Reserved
+  {ErrorHandler, 0x18},  // Channel 18 - Reserved
+  {ErrorHandler, 0x19},  // Channel 19 - Reserved
+  {ErrorHandler, 0x1A},  // Channel 1A - Reserved
+  {ErrorHandler, 0x1B},  // Channel 1B - Reserved
+  {ErrorHandler, 0x1C},  // Channel 1C - Reserved
+  {ErrorHandler, 0x1D},  // Channel 1D - Reserved
+  {ErrorHandler, 0x1E},  // Channel 1E - Reserved
+  {ErrorHandler, 0x1F},  // Channel 1F - Reserved
+  {ErrorHandler, 0x20},  // Channel 20 - Reserved
+  {ErrorHandler, 0x21},  // Channel 21 - Reserved
+  {ErrorHandler, 0x22},  // Channel 22 - Reserved
+  {ErrorHandler, 0x23},  // Channel 23 - Reserved
+  {ErrorHandler, 0x24},  // Channel 24 - Reserved
+  {ErrorHandler, 0x25},  // Channel 25 - Reserved
+  {ErrorHandler, 0x26},  // Channel 26 - Reserved
+  {ErrorHandler, 0x27},  // Channel 27 - Reserved
+  {ErrorHandler, 0x28},  // Channel 28 - Reserved
+  {ErrorHandler, 0x29},  // Channel 29 - Reserved
+  {ErrorHandler, 0x2A},  // Channel 2A - Reserved
+  {ErrorHandler, 0x2B},  // Channel 2B - Reserved
+  {ErrorHandler, 0x2C},  // Channel 2C - Reserved
+  {ErrorHandler, 0x2D},  // Channel 2D - Reserved
+  {ErrorHandler, 0x2E},  // Channel 2E - Reserved
+  {ErrorHandler, 0x2F},  // Channel 2F - Reserved
+  {ErrorHandler, 0x30},  // Channel 30 - XSRAM20K Access Violation
+  {ErrorHandler, 0x31},  // Channel 31 - XGATE Software Error Interrupt
+  {ErrorHandler, 0x32},  // Channel 32 - XGATE Software Trigger 7
+  {ErrorHandler, 0x33},  // Channel 33 - XGATE Software Trigger 6
+  {ErrorHandler, 0x34},  // Channel 34 - XGATE Software Trigger 5
+  {ErrorHandler, 0x35},  // Channel 35 - XGATE Software Trigger 4
+  {ErrorHandler, 0x36},  // Channel 36 - XGATE Software Trigger 3
+  {ErrorHandler, 0x37},  // Channel 37 - XGATE Software Trigger 2
+  {ErrorHandler, 0x38},  // Channel 38 - XGATE Software Trigger 1
+  {(XGATE_Function)SoftwareTrigger0_Handler, 39},  // Channel 39 - XGATE Software Trigger 0
+  {(XGATE_Function)PIT_Handler, 0x3A},  // Channel 3A - Periodic Interrupt Timer
+  {(XGATE_Function)PROTECT_Handler, 0x3B},  // Channel 3B - Periodic Interrupt Timer
+  {ErrorHandler, 0x3C},  // Channel 3C - Periodic Interrupt Timer
+  {ErrorHandler, 0x3D},  // Channel 3D - Periodic Interrupt Timer
+  {ErrorHandler, 0x3E},  // Channel 3E - Reserved
+  {ErrorHandler, 0x3F},  // Channel 3F - Autonomous Periodical interrupt API
+  {ErrorHandler, 0x40},  // Channel 40 - Low Voltage interrupt LVI
+  {ErrorHandler, 0x41},  // Channel 41 - IIC1 Bus
+  {ErrorHandler, 0x42},  // Channel 42 - SCI5
+  {ErrorHandler, 0x43},  // Channel 43 - SCI4
+  {ErrorHandler, 0x44},  // Channel 44 - SCI3
+  {ErrorHandler, 0x45},  // Channel 45 - SCI2
+  {ErrorHandler, 0x46},  // Channel 46 - PWM Emergency Shutdown
+  {ErrorHandler, 0x47},  // Channel 47 - Port P Interrupt
+  {ErrorHandler, 0x48},  // Channel 48 - CAN4 transmit
+  {(XGATE_Function)Can4Rx_Handle,0x49},  // Channel 49 - CAN4 receive
+  {ErrorHandler, 0x4A},  // Channel 4A - CAN4 errors
+  {ErrorHandler, 0x4B},  // Channel 4B - CAN4 wake-up
+  {ErrorHandler, 0x4C},  // Channel 4C - CAN3 transmit
+  {ErrorHandler, 0x4D},  // Channel 4D - CAN3 receive
+  {ErrorHandler, 0x4E},  // Channel 4E - CAN3 errors
+  {ErrorHandler, 0x4F},  // Channel 4F - CAN3 wake-up
+  {ErrorHandler, 0x50},  // Channel 50 - CAN2 transmit
+  {ErrorHandler, 0x51},  // Channel 51 - CAN2 receive
+  {ErrorHandler, 0x52},  // Channel 52 - CAN2 errors
+  {ErrorHandler, 0x53},  // Channel 53 - CAN2 wake-up
+  {ErrorHandler, 0x54},  // Channel 54 - CAN1 transmit
+  {(XGATE_Function)Can1Rx_Handle, 0x55},  // Channel 55 - CAN1 receive
+  {ErrorHandler, 0x56},  // Channel 56 - CAN1 errors
+  {ErrorHandler, 0x57},  // Channel 57 - CAN1 wake-up
+  {ErrorHandler, 0x58},  // Channel 58 - CAN0 transmit
+  {(XGATE_Function)Can0Rx_Handle, 0x59},  // Channel 59 - CAN0 receive
+  {ErrorHandler, 0x5A},  // Channel 5A - CAN0 errors
+  {ErrorHandler, 0x5B},  // Channel 5B - CAN0 wake-up
+  {ErrorHandler, 0x5C},  // Channel 5C - FLASH
+  {ErrorHandler, 0x5D},  // Channel 5D - EEPROM
+  {ErrorHandler, 0x5E},  // Channel 5E - SPI2
+  {ErrorHandler, 0x5F},  // Channel 5F - SPI1
+  {ErrorHandler, 0x60},  // Channel 60 - IIC0 Bus
+  {ErrorHandler, 0x61},  // Channel 61 - Reserved
+  {ErrorHandler, 0x62},  // Channel 62 - CRG Self Clock Mode
+  {ErrorHandler, 0x63},  // Channel 63 - CRG PLL lock
+  {ErrorHandler, 0x64},  // Channel 64 - Pulse Accumulator B Overflow
+  {ErrorHandler, 0x65},  // Channel 65 - Modulus Down Counter underflow
+  {ErrorHandler, 0x66},  // Channel 66 - Port H
+  {ErrorHandler, 0x67},  // Channel 67 - Port J
+  {ErrorHandler, 0x68},  // Channel 68 - ATD1
+  {ErrorHandler, 0x69},  // Channel 69 - ATD0
+  {ErrorHandler, 0x6A},  // Channel 6A - SCI1
+  {ErrorHandler, 0x6B},  // Channel 6B - SCI0
+  {ErrorHandler, 0x6C},  // Channel 6C - SPI0
+  {ErrorHandler, 0x6D},  // Channel 6D - Pulse accumulator input edge
+  {ErrorHandler, 0x6E},  // Channel 6E - Pulse accumulator A overflow
+  {ErrorHandler, 0x6F},  // Channel 6F - Enhanced Capture Timer overflow
+  {ErrorHandler, 0x70},  // Channel 70 - Enhanced Capture Timer channel 7
+  {ErrorHandler, 0x71},  // Channel 71 - Enhanced Capture Timer channel 6
+  {ErrorHandler, 0x72},  // Channel 72 - Enhanced Capture Timer channel 5
+  {ErrorHandler, 0x73},  // Channel 73 - Enhanced Capture Timer channel 4
+  {ErrorHandler, 0x74},  // Channel 74 - Enhanced Capture Timer channel 3
+  {ErrorHandler, 0x75},  // Channel 75 - Enhanced Capture Timer channel 2
+  {ErrorHandler, 0x76},  // Channel 76 - Enhanced Capture Timer channel 1
+  {ErrorHandler, 0x77},  // Channel 77 - Enhanced Capture Timer channel 0
+  {ErrorHandler, 0x78},  // Channel 78 - Real Time Interrupt
+  {ErrorHandler, 0x79},  // Channel 79 - IRQ
+};

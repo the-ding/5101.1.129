@@ -1,0 +1,7 @@
+{
+    "files.encoding": "gbk",
+    "files.associations": {
+        "*.cxgate": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}
