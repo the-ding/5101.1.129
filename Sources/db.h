@@ -1,6 +1,6 @@
 /*最大可接采集板个数（最大31）*/
-#define DEV_MAX               9         //从控数量  注3.0单独指BMU，CR450指的HMPU
-#define VC_MAX                9
+#define DEV_MAX               1         //从控数量  注3.0单独指BMU，CR450指的HMPU
+#define VC_MAX                1
 //#define TC_MAX                2
 #define DEV_IN                1
 
@@ -10,8 +10,8 @@
 /*系统总共最大可接电池支数*/
 #define SYS_CELL_MAX          DEV_MAX*36
 
-#define BAT_VALID_MAX         324   //324 采集电压数
-#define TEM_VALID_MAX         324  //324 采集温度数
+#define BAT_VALID_MAX         36   //324 采集电压数
+#define TEM_VALID_MAX         36  //324 采集温度数
 
 #define DAY_INDEX_MAX         100     /*最多保存100天的历史数据*/
 #define DAY_INDEX_SIZE        32      /*每天的摘要数据长度 > sizeof(DBDayIndexRec)*/

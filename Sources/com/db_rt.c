@@ -441,6 +441,9 @@ static void UpdateVolRt (void)
         for(j=0;j<2;j++){
           for(k=0;k<18;k++){
             if(((LECU_NVT[i].Cell_Valid[j]>>k)&0x0001)==1){
+                if(Cell_Temp_Volts[i*36+j*18+k] == 0xFF) {
+                    Cell_Temp_Volts[i*36+j*18+k] = 0;
+                }
               Cell_Volts[Bat_A_num++]=Cell_Temp_Volts[i*36+j*18+k];
               Bat_L_num++;
             }
@@ -680,9 +683,9 @@ static void UpdateTempRt (void)
 
                 // 无效温度过滤：0xFF 视为采集异常，直接跳过，不参与统计
                 // 考虑到屏幕显示先不过滤，等后续再处理
-                // if(temp_val == 0xFF) {
-                //     continue;
-                // }
+                if(temp_val == 0xFF) {
+                    temp_val = 55;
+                }
 
                 // 1. 存入 Temp_point（供外部使用）
                 Temp_point[(UINT16)i * 36 + T_L_num] = temp_val;

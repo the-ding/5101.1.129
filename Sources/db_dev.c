@@ -166,7 +166,7 @@ void DEV_Init (void)
         Sys_Para.temp_heat_on = 0+55;
         Sys_Para.temp_heat_off = 5+55;
         
-        Sys_Para.cap_stand = 69;
+        Sys_Para.cap_stand = 138;
         Sys_Para.shutcur = 4;           // 4∞≤≈‡
         
         Sys_Para.full_cha_c = 600;

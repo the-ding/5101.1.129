@@ -18,7 +18,7 @@
  
 #define VER_TIME_Y                  26                  //内部版本
 #define VER_TIME_M                  10                   //内部版本
-#define VER_TIME_D                  23                  //内部版本
+#define VER_TIME_D                  25                  //内部版本
 #define VER_YG                      1                   //内部版本
 
 
@@ -64,7 +64,7 @@
 #define NC_CLOSE                    0x01
 #define NC_OPEN                     0x00
 
-#define BAT_KWH                      514   //51.4kWh
+#define BAT_KWH                      48   //4.76kWh
 
 /////////////////////////自检状态///////////////////////////////
 #define NSC                         0               //未自检
@@ -377,9 +377,9 @@ static volatile UINT8       hot_stage           = 0;                //加热流程 0
 static volatile UINT8       pre_status = 0;     //预充状态
 static volatile UINT8       charge_mode_BMS     = 0;
 static volatile UINT8       mode_stage[4]       = {0xff,0xff,0xff,0xff};
-static volatile UINT32      Q_remain            = 514;               //可用电量初始值
-static volatile UINT32      Q_usable            = 514;
-static volatile UINT32      Q_lock              = 514;
+static volatile UINT32      Q_remain            = 48;               //可用电量初始值
+static volatile UINT32      Q_usable            = 48;
+static volatile UINT32      Q_lock              = 48;
 static volatile UINT8       KOUT_flag           = 0xff;   //继电器状态
 
 static volatile UINT8       Heart_RCAN1         = 0;      //CAN1接收心跳
@@ -3871,7 +3871,7 @@ static void StsChk (void)
 static void SOC_correction1(void) {
     SINT16 temy_soc =0;
     UINT8   soc_no_flag = 0;
-    UINT16 Soc_bmrk[10] ={6836,6966,7063,7160,7298,7517,7647,7808,8068,8229};
+    UINT16 Soc_bmrk[10] = {316, 323, 327, 331, 338, 348, 354, 361, 373, 381};
 
     
     if(Sys_Rt.current==0) {               //0<电流<10A
@@ -3959,7 +3959,6 @@ void save_sign_function(void)
   
     //T_Voltage = dv4000_to_voltage_01v(ttttwww[0]);
     O_Voltage = dvl1000_to_voltage_01v(ttttwww[0]);
-    Sys_Rt.current = 100;
     ////绝缘模块继电器正1电压
     Sys_Rt.relayFAST      = IWD_Res;
     ////绝缘模块继电器正2电压 
@@ -4355,88 +4354,37 @@ static void Protect (void)
     }
 }
 
-/***************************************/
-/* /流程/                              */
-/***************************************/
 static void Turn_On(void) {
+    static UINT8 iwd_check_done = 0;
 
     switch(ks_stage){
-                 //////////////////上电自检 ks_stage==0~9///////////////////////////////////
-            case 0:
-                if(EXPIRED_T(TIMER_TURN_ON,15000)) {//上电延迟15s，开始自检
-                    check_bms=NSC; 
-                    sta_ele           = Sys_Rt.wh;
-                    end_ele           = Sys_Rt.wh;
-                    IWD_cmd = 0xff; //表示未进行绝缘检测
-                    ks_stage=1;
-                    TIMER_RESET_T(TIMER_TURN_ON);
-                }
-                break;
-            case 1:
-                if(EXPIRED_T(TIMER_TURN_ON,15000)){  //自检开始延迟15s，切换到自检状态
-                    check_bms=SCR;  
-                    ks_stage=2;
-                    TIMER_RESET_T(TIMER_TURN_ON);
-                }
-                break;
-            case 2:
-                //进行绝缘检测
-                if(IWD_sta==0xAA){   //判断绝缘是否正常
-                    IWDCheck=(UINT8)Check_IWD(); //检测绝缘电阻
-                    if(IWDCheck==0){
-                        IWD_cmd  = 0;   
-                        FAU_IWD=0; 
-                        Bat_Fault_Code[3] &= ~IWD_ERR; 
-                        ks_stage = 3;
-                        TIMER_RESET_T(TIMER_TURN_ON);
-                    }else{
-                       FAU_IWD=1;       //绝缘检测故障
-                       Bat_Fault_Code[3] |= IWD_ERR;       //绝缘检测故障
-                       check_bms=SCF;         //自检失败
-                       
-                       ks_stage = 3;
-  
-                    }
-                }
-                if(Alarm_Status==0x55){ //绝缘内部警告
-                    FAU_IWD=1;       //绝缘检测故障
-                    Bat_Fault_Code[3] |= IWD_ERR;       //绝缘检测故障
-                    check_bms=SCF;         //自检失败
-                    Bat_Sys_sts = 0x03;
-                }
-                ks_stage = 3;
+        case 0:
+            // 上电直接等 30 秒，给绝缘仪启动时间
+            if(EXPIRED_T(TIMER_TURN_ON, 30000)) {
+                sta_ele = Sys_Rt.wh;
+                end_ele = Sys_Rt.wh;
+                IWD_cmd = 0xff;        // 30秒到了，打开绝缘检测
+                ks_stage = 1;
+                TIMER_RESET_T(TIMER_TURN_ON);
+            }
             break;
-            case 3:
-                //判断是否连接了电池（自检应为全部断开状态）
-                if((Contact_Open==1)){//(Sys_Rt.num_lecu!=OEM_Para.lecu_num)||  
-                    check_bms=SCF;         //自检失败
-                    ks_stage =4;
-                }else{
-                    ks_stage =4;
-                    check_bms=SCS;    //自检成功
-                } 
-              
-             
             
+        case 1:
+            // 等待绝缘仪返回状态 (0xAA)
+            if(IWD_sta == 0xAA) {
+                
+                // 无论正常还是故障，立即关闭绝缘检测
+                IWD_cmd = 0;
+                iwd_check_done = 1;
+                ks_stage = 2; // 进入完成状态
+            }
             break;
-            case 4:
-                ks_stage = 5;
-            break;
-            case 5:
-                  TR_Work_mode = 0;
-                  if(Bat_Sys_sts != 3){
-                    Bat_Sys_sts = 4;      //待机
-                    
-                  }
-
-                  TIMER_RESET_T(TIMER_TURN_ON);             
-                  ks_stage = 6;
-            break;
-            case 6:   
-
+            
+        case 2:
+            // 绝缘检测完成，保持关闭状态
+            IWD_cmd = 0;
             break;
     }
-    
 }
 
 
@@ -4990,12 +4938,11 @@ static void Calc_Bat_Power(void)
  void plt_main (void) {
     if (gSysTicks < 30)
     return;
-
-    IWD_cmd = 0xff;
-    //Turn_On();
+    Turn_On();
     Rx_can0();
     Rx_can1();
     Tx1();
     save_sign_function(); 
+    SOC_correction1();
  }
 #endif
